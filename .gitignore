@@ -1,0 +1,39 @@
+# Environment files
+.env
+.env.local
+.env.production
+
+# Log files
+*.log
+web.log
+nohup.out
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+*.tmp
+
+# Docker files
+docker-compose.override.yml
+
+# Backup files
+*.bak
+*.backup
