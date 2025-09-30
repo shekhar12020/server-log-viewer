@@ -28,12 +28,36 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+# Try to import psycopg2 for direct DB connections, fallback to docker exec
+try:
+    import psycopg2
+    import psycopg2.extras
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    PSYCOPG2_AVAILABLE = False
+
 
 HOST = os.environ.get("LOG_WEB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("LOG_WEB_PORT", "8080"))
 DOCKER_SUDO = os.environ.get("LOG_WEB_DOCKER_SUDO", "0").strip() in ("1", "true", "yes", "on")
 DOCKER_BIN = os.environ.get("LOG_WEB_DOCKER_BIN", "docker").strip() or "docker"
 TOKEN = os.environ.get("LOG_WEB_TOKEN", "")
+
+# Optional database read-only access via docker exec to Postgres
+DB_CONTAINER = os.environ.get("LOG_WEB_DB_CONTAINER", "").strip()
+DB_NAME = os.environ.get("LOG_WEB_DB_NAME", "").strip()
+DB_USER_RO = os.environ.get("LOG_WEB_DB_USER_RO", "").strip()
+DB_PASS_RO = os.environ.get("LOG_WEB_DB_PASS_RO", "").strip()
+# Comma-separated table whitelist, e.g. "users,orders,order_items"
+DB_TABLE_WHITELIST = {
+    t.strip() for t in os.environ.get("LOG_WEB_DB_TABLE_WHITELIST", "").split(",") if t.strip()
+}
+DB_TOKEN = os.environ.get("LOG_WEB_DB_TOKEN", "").strip()
+
+# RDS connection settings
+DB_HOST = os.environ.get("LOG_WEB_DB_HOST", "").strip()
+DB_PORT = int(os.environ.get("LOG_WEB_DB_PORT", "5432"))
+DB_SSL = os.environ.get("LOG_WEB_DB_SSL", "1").strip() in ("1", "true", "yes", "on")
 
 
 def docker_cmd(args):
@@ -76,6 +100,146 @@ def list_containers():
     except Exception as e:
         return [], str(e)
 
+
+def _db_connect():
+    """Connect to database - prefer RDS direct connection, fallback to docker exec"""
+    if PSYCOPG2_AVAILABLE and DB_HOST and DB_NAME and DB_USER_RO and DB_PASS_RO:
+        # Direct RDS connection
+        try:
+            conn = psycopg2.connect(
+                host=DB_HOST,
+                port=DB_PORT,
+                database=DB_NAME,
+                user=DB_USER_RO,
+                password=DB_PASS_RO,
+                sslmode='require' if DB_SSL else 'disable'
+            )
+            return True, conn
+        except Exception as e:
+            return False, f"RDS connection failed: {e}"
+    elif DB_CONTAINER and DB_NAME and DB_USER_RO and DB_PASS_RO:
+        # Fallback to docker exec
+        return True, "docker"
+    else:
+        return False, "DB is not configured (set LOG_WEB_DB_HOST, LOG_WEB_DB_NAME, LOG_WEB_DB_USER_RO, LOG_WEB_DB_PASS_RO or use docker exec)"
+
+
+def _db_exec_psql(args, timeout_sec=10):
+    """Execute SQL - prefer direct connection, fallback to docker exec"""
+    ok, conn_or_mode = _db_connect()
+    if not ok:
+        return False, conn_or_mode
+    
+    if conn_or_mode == "docker":
+        # Docker exec fallback
+        if not (DB_CONTAINER and DB_NAME and DB_USER_RO and DB_PASS_RO):
+            return False, "Docker exec not configured"
+        base = ["docker", "exec", "-e", f"PGPASSWORD={DB_PASS_RO}", DB_CONTAINER, "psql", "-U", DB_USER_RO, "-d", DB_NAME, "-t", "-A"]
+        cmd = docker_cmd(base + args)
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            out, err = proc.communicate(timeout=timeout_sec)
+            if proc.returncode != 0:
+                return False, (err or out or f"psql exited {proc.returncode}").strip()
+            return True, out
+        except Exception as e:
+            return False, str(e)
+    else:
+        # Direct connection
+        conn = conn_or_mode
+        try:
+            with conn.cursor() as cur:
+                # Extract SQL from args (last element should be the -c SQL)
+                sql = args[-1] if args and args[-1].startswith('-c') else ' '.join(args)
+                if sql.startswith('-c '):
+                    sql = sql[3:]
+                cur.execute(sql)
+                rows = cur.fetchall()
+                # Convert to tab-separated output like psql -t -A
+                out = '\n'.join('\t'.join(str(cell) for cell in row) for row in rows)
+                return True, out
+        except Exception as e:
+            return False, str(e)
+        finally:
+            conn.close()
+
+
+def db_list_tables():
+    # If a whitelist is provided, return that directly
+    if DB_TABLE_WHITELIST:
+        return True, sorted(DB_TABLE_WHITELIST)
+    # List tables across all non-system schemas (exclude pg_catalog, information_schema)
+    sql = (
+        "SELECT schemaname || '.' || tablename "
+        "FROM pg_tables "
+        "WHERE schemaname NOT IN ('pg_catalog','information_schema','pg_toast') "
+        "ORDER BY 1;"
+    )
+    ok, out = _db_exec_psql(["-c", sql])
+    if not ok:
+        return False, out
+    tables = [line.strip() for line in out.splitlines() if line.strip()]
+    return True, tables
+
+
+def _is_valid_table_name(name: str) -> bool:
+    if not name or len(name) > 128:
+        return False
+    # allow schema-qualified names like schema.table
+    parts = name.split(".")
+    if len(parts) > 2:
+        return False
+    for part in parts:
+        if not part or len(part) > 64:
+            return False
+        for ch in part:
+            if not (ch.isalnum() or ch == "_"):
+                return False
+    return True
+
+
+def db_select_table(table: str, limit: int, offset: int):
+    if not _is_valid_table_name(table):
+        return False, "invalid table name"
+    if DB_TABLE_WHITELIST and table not in DB_TABLE_WHITELIST:
+        return False, "table not allowed"
+
+    # Split optional schema
+    if "." in table:
+        schema_name, table_name = table.split(".", 1)
+    else:
+        schema_name, table_name = "public", table
+
+    # First get column names
+    col_sql = (
+        f"SELECT column_name FROM information_schema.columns "
+        f"WHERE table_schema = '{schema_name}' AND table_name = '{table_name}' "
+        f"ORDER BY ordinal_position;"
+    )
+    ok, col_out = _db_exec_psql(["-c", col_sql])
+    if not ok:
+        return False, col_out
+    
+    columns = [line.strip() for line in col_out.splitlines() if line.strip()]
+    
+    # Build safe SQL with validated identifiers and numeric limits
+    sql = (
+        f"SELECT * FROM \"{schema_name}\".\"{table_name}\" "
+        f"LIMIT {int(limit)} OFFSET {int(offset)};"
+    )
+    ok, out = _db_exec_psql(["-c", sql])
+    if not ok:
+        return False, out
+
+    # Parse TSV headerless output into rows of columns
+    rows = []
+    for line in out.splitlines():
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        cols = line.split("\t")
+        rows.append(cols)
+    return True, {"columns": columns, "rows": rows, "limit": limit, "offset": offset, "table": table}
 
 INDEX_HTML = """
 <!doctype html>
@@ -177,6 +341,8 @@ INDEX_HTML = """
       display: flex;
       flex: 1;
       overflow: hidden;
+      height: 60vh;
+      min-height: 400px;
       /* Let it naturally fill remaining height for better responsiveness */
     }
     /* Prevent flex children from forcing horizontal overflow */
@@ -215,7 +381,7 @@ INDEX_HTML = """
     #log { 
       white-space: pre; 
       font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Cascadia Code', 'Consolas', 'Monaco', monospace; 
-      padding: 0 20px 0 20px; 
+      padding: 15px 20px; 
       flex: 1;
       overflow-y: auto; 
       overflow-x: auto; /* allow horizontal scroll on narrow screens */
@@ -223,6 +389,8 @@ INDEX_HTML = """
       color: #c9d1d9; 
       line-height: 1.5;
       border: 1px solid #30363d;
+      height: 100%;
+      min-height: 400px;
       font-size: 13px;
       border-radius: 0 0 12px 12px;
       box-sizing: border-box;
@@ -323,11 +491,101 @@ INDEX_HTML = """
   <script>
       let es = null;
       let token = '';
+      let dbToken = '';
       let isPaused = false; // Track pause state
       let scrollCheckEnabled = false; // Delay scroll checking until logs are flowing
       let userInteracting = false; // True briefly after wheel/touch/keys/mouse to mark manual intent
     
     function $(id){ return document.getElementById(id); }
+        async function loadDbTables(){
+          try {
+            const t = dbToken || (new URLSearchParams(location.search)).get('db_token') || $('dbToken')?.value || '';
+            const url = t ? ('/db/tables?token='+encodeURIComponent(t)) : '/db/tables';
+            const res = await fetch(url);
+            const out = $('dbResult');
+            if (!res.ok) {
+              const txt = await res.text();
+              out.textContent = 'Error loading tables: '+txt;
+              return;
+            }
+            const tables = await res.json();
+            const sel = $('dbTables');
+            sel.innerHTML = '';
+            for (const name of tables) {
+              const opt = document.createElement('option');
+              opt.value = name; opt.textContent = name;
+              sel.appendChild(opt);
+            }
+            out.textContent = 'Loaded '+tables.length+' tables.';
+          } catch (e) {
+            const out = $('dbResult');
+            out.textContent = 'Error: '+e;
+          }
+        }
+
+        async function fetchDbTable(){
+          try {
+            const name = $('dbTables').value;
+            const limit = $('dbLimit').value || '20';
+            const offset = $('dbOffset').value || '0';
+            const t = dbToken || (new URLSearchParams(location.search)).get('db_token') || $('dbToken')?.value || '';
+            if (!name) { $('dbResult').textContent = 'Select a table first'; return; }
+            const params = new URLSearchParams({ name, limit, offset });
+            if (t) params.set('token', t);
+            const res = await fetch('/db/table?'+params.toString());
+            const out = $('dbResult');
+            if (!res.ok) {
+              const txt = await res.text();
+              out.textContent = 'Error: '+txt;
+              return;
+            }
+            const data = await res.json();
+            if (data.error) {
+              out.innerHTML = '<div style="color: #f85149;">Error: '+data.error+'</div>';
+              return;
+            }
+            
+            if (!data.rows || data.rows.length === 0) {
+              out.innerHTML = '<div style="color: #7d8590;">No data found</div>';
+              return;
+            }
+            
+            // Create HTML table
+            let tableHtml = '<table style="width: 100%; border-collapse: collapse; font-family: monospace; font-size: 12px;">';
+            
+            // Add header row (if we have column info)
+            if (data.columns && data.columns.length > 0) {
+              tableHtml += '<thead><tr style="background: #21262d; color: #f0f6fc; font-weight: bold;">';
+              for (const col of data.columns) {
+                tableHtml += '<th style="padding: 8px; border: 1px solid #30363d; text-align: left;">'+col+'</th>';
+              }
+              tableHtml += '</tr></thead>';
+            }
+            
+            // Add data rows
+            tableHtml += '<tbody>';
+            for (let i = 0; i < data.rows.length; i++) {
+              const row = data.rows[i];
+              const bgColor = i % 2 === 0 ? '#0d1117' : '#161b22';
+              tableHtml += '<tr style="background: '+bgColor+';">';
+              for (const cell of row) {
+                const cellValue = cell === null ? '<span style="color: #7d8590; font-style: italic;">NULL</span>' : 
+                                 cell === '' ? '<span style="color: #7d8590;">(empty)</span>' : 
+                                 String(cell).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                tableHtml += '<td style="padding: 6px 8px; border: 1px solid #30363d; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="'+String(cell).replace(/"/g, '&quot;')+'">'+cellValue+'</td>';
+              }
+              tableHtml += '</tr>';
+            }
+            tableHtml += '</tbody></table>';
+            
+            // Add summary info
+            const summary = '<div style="margin-bottom: 10px; color: #7d8590; font-size: 11px;">Showing '+data.rows.length+' rows from '+data.table+' (limit: '+data.limit+', offset: '+data.offset+')</div>';
+            
+            out.innerHTML = summary + tableHtml;
+          } catch (e) {
+            $('dbResult').textContent = 'Error: '+e;
+          }
+        }
         // Mark user interaction for a short window to disambiguate manual vs programmatic scroll
         setTimeout(() => {
           const logEl = $('log');
@@ -740,6 +998,7 @@ INDEX_HTML = """
       console.log('Page loaded, starting loadContainers...');
       const urlParams = new URLSearchParams(location.search);
       token = urlParams.get('token') || '';
+        dbToken = urlParams.get('db_token') || '';
       
       // Initialize UI state
       resetUI();
@@ -755,6 +1014,12 @@ INDEX_HTML = """
       $('disconnect').addEventListener('click', disconnect);
       $('reload').addEventListener('click', reloadContainers);
       $('clear').addEventListener('click', clearLogs);
+        // DB panel listeners (if present)
+        if ($('dbToken')) {
+          $('dbToken').addEventListener('input', (e) => { dbToken = e.target.value; });
+        }
+        if ($('dbLoadTables')) $('dbLoadTables').addEventListener('click', loadDbTables);
+        if ($('dbFetch')) $('dbFetch').addEventListener('click', fetchDbTable);
       
       // Add scroll listener to detect manual scrolling
       $('log').addEventListener('scroll', checkScrollPosition);
@@ -810,7 +1075,39 @@ INDEX_HTML = """
         <div class="line-numbers" id="lineNumbers"></div>
         <pre id="log"></pre>
       </div>
-      <footer>💡 Tip: Add ?token=YOUR_TOKEN to the URL if the server requires authentication</footer>
+    </div>
+    <!-- Read-only Database Panel -->
+    <div class="container" style="margin-top: 10px;">
+      <header>
+        <h1>🗄️ Database (read-only)</h1>
+        <div class="controls">
+          <div class="control-group">
+            <label>DB Token</label>
+            <input id="dbToken" placeholder="db token (optional if not set)" />
+          </div>
+          <div class="control-group">
+            <label>&nbsp;</label>
+            <button id="dbLoadTables">List Tables</button>
+          </div>
+          <div class="control-group">
+            <label>Tables</label>
+            <select id="dbTables"><option value="">Select…</option></select>
+          </div>
+          <div class="control-group">
+            <label>Limit</label>
+            <input id="dbLimit" value="20" />
+          </div>
+          <div class="control-group">
+            <label>Offset</label>
+            <input id="dbOffset" value="0" />
+          </div>
+          <div class="control-group">
+            <label>&nbsp;</label>
+            <button id="dbFetch">Fetch</button>
+          </div>
+        </div>
+      </header>
+      <div id="dbResult" style="padding: 20px; margin: 0; background: #0d1117; color: #c9d1d9; height: calc(100vh - 200px); min-height: 500px; overflow: auto; border: 1px solid #30363d; border-top: none; border-radius: 0 0 12px 12px;"></div>
     </div>
   </body>
 </html>
@@ -831,6 +1128,12 @@ def check_token(query):
     if not TOKEN:
         return True
     return query.get("token", [""])[0] == TOKEN
+
+
+def check_db_token(query):
+    if not DB_TOKEN:
+        return True
+    return query.get("token", [""])[0] == DB_TOKEN
 
 
 def line_passes_filters(line: str, level: str, q: str) -> bool:
@@ -934,6 +1237,33 @@ class Handler(BaseHTTPRequestHandler):
                         proc.terminate()
                 except Exception:
                     pass
+            return
+
+        # ---- DB read-only endpoints ----
+        if path == "/db/tables":
+            if not check_db_token(query):
+                self.send_error(HTTPStatus.UNAUTHORIZED, "Unauthorized")
+                return
+            ok, resp = db_list_tables()
+            if not ok:
+                send_json(self, {"error": resp}, status=HTTPStatus.BAD_GATEWAY)
+            else:
+                send_json(self, resp)
+            return
+
+        if path == "/db/table":
+            if not check_db_token(query):
+                self.send_error(HTTPStatus.UNAUTHORIZED, "Unauthorized")
+                return
+            tbl = (query.get("name", [""])[0] or "").strip()
+            limit = min(max(int((query.get("limit", ["100"])[0] or "100").strip()), 1), 500)
+            offset = max(int((query.get("offset", ["0"])[0] or "0").strip()), 0)
+
+            ok, resp = db_select_table(tbl, limit, offset)
+            if not ok:
+                send_json(self, {"error": resp}, status=HTTPStatus.BAD_REQUEST)
+            else:
+                send_json(self, resp)
             return
 
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
