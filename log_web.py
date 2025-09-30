@@ -241,6 +241,67 @@ def db_select_table(table: str, limit: int, offset: int):
         rows.append(cols)
     return True, {"columns": columns, "rows": rows, "limit": limit, "offset": offset, "table": table}
 
+
+def _is_safe_readonly_sql(sql: str) -> bool:
+    if not sql:
+        return False
+    s = sql.strip().lower()
+    # Only allow single-statement SELECT queries
+    if not s.startswith("select"):
+        return False
+    disallowed = (";", " update ", " delete ", " insert ", " drop ", " alter ", " create ", " grant ", " revoke ", " truncate ", " vacuum ")
+    for token in disallowed:
+        if token in f" {s} ":
+            return False
+    return True
+
+
+def db_run_query(user_sql: str, limit: int):
+    """Run a safe read-only SELECT query and return columns and rows.
+    Applies a hard row limit by wrapping the query.
+    """
+    if not _is_safe_readonly_sql(user_sql):
+        return False, "only single SELECT statements are allowed"
+
+    # Enforce a hard limit by wrapping as a subquery
+    safe_limit = min(max(int(limit or 100), 1), 1000)
+    wrapped_sql = f"SELECT * FROM ( {user_sql} ) AS subquery LIMIT {safe_limit}"
+
+    # Prefer direct connection to capture column names
+    ok, conn_or_mode = _db_connect()
+    if not ok:
+        return False, conn_or_mode
+
+    if conn_or_mode == "docker":
+        # Fallback via psql; we won't have column names easily
+        ok, out = _db_exec_psql(["-c", wrapped_sql])
+        if not ok:
+            return False, out
+        rows = []
+        for line in out.splitlines():
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            rows.append(line.split("\t"))
+        return True, {"columns": [], "rows": rows, "limit": safe_limit}
+
+    # Direct connection path with psycopg2
+    conn = conn_or_mode
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute("SET LOCAL statement_timeout = 5000")
+            except Exception:
+                pass
+            cur.execute(wrapped_sql)
+            rows = cur.fetchall()
+            cols = [d[0] for d in (cur.description or [])]
+            return True, {"columns": cols, "rows": rows, "limit": safe_limit}
+    except Exception as e:
+        return False, str(e)
+    finally:
+        conn.close()
+
 INDEX_HTML = """
 <!doctype html>
 <html>
@@ -581,6 +642,52 @@ INDEX_HTML = """
             // Add summary info
             const summary = '<div style="margin-bottom: 10px; color: #7d8590; font-size: 11px;">Showing '+data.rows.length+' rows from '+data.table+' (limit: '+data.limit+', offset: '+data.offset+')</div>';
             
+            out.innerHTML = summary + tableHtml;
+          } catch (e) {
+            $('dbResult').textContent = 'Error: '+e;
+          }
+        }
+
+        async function runDbQuery(){
+          try {
+            const q = $('dbSql').value || '';
+            const limit = $('dbSqlLimit').value || '200';
+            const t = dbToken || (new URLSearchParams(location.search)).get('db_token') || $('dbToken')?.value || '';
+            if (!q.trim()) { $('dbResult').textContent = 'Enter a SELECT query to run'; return; }
+            const res = await fetch('/db/query' + (t?('?token='+encodeURIComponent(t)):'') , {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ q, limit, token: t })
+            });
+            const out = $('dbResult');
+            if (!res.ok) {
+              const txt = await res.text();
+              out.textContent = 'Error: '+txt;
+              return;
+            }
+            const data = await res.json();
+            if (data.error) { out.innerHTML = '<div style="color:#f85149;">Error: '+data.error+'</div>'; return; }
+            if (!data.rows || data.rows.length === 0) { out.innerHTML = '<div style="color:#7d8590;">No rows</div>'; return; }
+
+            let tableHtml = '<table style="width: 100%; border-collapse: collapse; font-family: monospace; font-size: 12px;">';
+            if (data.columns && data.columns.length) {
+              tableHtml += '<thead><tr style="background:#21262d; color:#f0f6fc;">';
+              for (const col of data.columns) tableHtml += '<th style="padding:8px; border:1px solid #30363d; text-align:left;">'+col+'</th>';
+              tableHtml += '</tr></thead>';
+            }
+            tableHtml += '<tbody>';
+            for (let i=0;i<data.rows.length;i++){
+              const row = data.rows[i];
+              const bg = i%2===0?'#0d1117':'#161b22';
+              tableHtml += '<tr style="background:'+bg+';">';
+              for (const cell of row){
+                const v = (cell===null)?'<span style="color:#7d8590;font-style:italic;">NULL</span>':String(cell).replace(/</g,'&lt;').replace(/>/g,'&gt;');
+                tableHtml += '<td style="padding:6px 8px; border:1px solid #30363d; max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="'+String(cell).replace(/"/g,'&quot;')+'">'+v+'</td>';
+              }
+              tableHtml += '</tr>';
+            }
+            tableHtml += '</tbody></table>';
+            const summary = '<div style="margin-bottom:10px;color:#7d8590;font-size:11px;">Showing '+data.rows.length+' rows (max '+data.limit+')</div>';
             out.innerHTML = summary + tableHtml;
           } catch (e) {
             $('dbResult').textContent = 'Error: '+e;
@@ -1020,6 +1127,7 @@ INDEX_HTML = """
         }
         if ($('dbLoadTables')) $('dbLoadTables').addEventListener('click', loadDbTables);
         if ($('dbFetch')) $('dbFetch').addEventListener('click', fetchDbTable);
+        if ($('dbRun')) $('dbRun').addEventListener('click', runDbQuery);
       
       // Add scroll listener to detect manual scrolling
       $('log').addEventListener('scroll', checkScrollPosition);
@@ -1107,7 +1215,23 @@ INDEX_HTML = """
           </div>
         </div>
       </header>
-      <div id="dbResult" style="padding: 20px; margin: 0; background: #0d1117; color: #c9d1d9; height: calc(100vh - 200px); min-height: 500px; overflow: auto; border: 1px solid #30363d; border-top: none; border-radius: 0 0 12px 12px;"></div>
+      <div style="padding: 12px 24px;">
+        <div class="control-group" style="width:100%;">
+          <label>Custom SQL (SELECT only)</label>
+          <textarea id="dbSql" placeholder="SELECT * FROM public.users LIMIT 20" style="width:100%; min-height:120px; font-family: 'JetBrains Mono', monospace; font-size:12px; padding:10px; border:1px solid #d1d5db; border-radius:6px; resize:vertical;"></textarea>
+        </div>
+        <div class="controls" style="margin: 8px 0 16px 0;">
+          <div class="control-group">
+            <label>Max rows</label>
+            <input id="dbSqlLimit" value="200" />
+          </div>
+          <div class="control-group">
+            <label>&nbsp;</label>
+            <button id="dbRun">Execute Query</button>
+          </div>
+        </div>
+        <div id="dbResult" style="padding: 20px; margin: 0; background: #0d1117; color: #c9d1d9; height: calc(100vh - 360px); min-height: 360px; overflow: auto; border: 1px solid #30363d; border-radius: 12px;"></div>
+      </div>
     </div>
   </body>
 </html>
@@ -1115,7 +1239,8 @@ INDEX_HTML = """
 
 
 def send_json(handler: BaseHTTPRequestHandler, obj, status=HTTPStatus.OK):
-    data = json.dumps(obj).encode("utf-8")
+    # Use default=str to safely serialize datetimes, Decimals, UUIDs, etc.
+    data = json.dumps(obj, default=str).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(data)))
@@ -1266,10 +1391,62 @@ class Handler(BaseHTTPRequestHandler):
                 send_json(self, resp)
             return
 
+        if path == "/db/query":
+            if not check_db_token(query):
+                self.send_error(HTTPStatus.UNAUTHORIZED, "Unauthorized")
+                return
+            q = (query.get("q", [""])[0] or "").strip()
+            limit = min(max(int((query.get("limit", ["200"])[0] or "200").strip()), 1), 1000)
+            ok, resp = db_run_query(q, limit)
+            if not ok:
+                send_json(self, {"error": resp}, status=HTTPStatus.BAD_REQUEST)
+            else:
+                send_json(self, resp)
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
     def log_message(self, fmt, *args):  # quieter server logs
         return
+
+    def do_POST(self):  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
+
+        # Only endpoint: /db/query with JSON body { q, limit, token }
+        if path == "/db/query":
+            # Auth: allow token in query string or JSON body
+            if not check_db_token(query):
+                # Try from JSON
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    body = self.rfile.read(length) if length else b"{}"
+                    data = json.loads(body or b"{}")
+                except Exception:
+                    data = {}
+                if data.get("token") != DB_TOKEN and DB_TOKEN:
+                    self.send_error(HTTPStatus.UNAUTHORIZED, "Unauthorized")
+                    return
+            else:
+                # Already authorized via query token; still read body
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    body = self.rfile.read(length) if length else b"{}"
+                    data = json.loads(body or b"{}")
+                except Exception:
+                    data = {}
+
+            q = (data.get("q") or "").strip()
+            limit = min(max(int(str(data.get("limit") or "200").strip()), 1), 1000)
+            ok, resp = db_run_query(q, limit)
+            if not ok:
+                send_json(self, {"error": resp}, status=HTTPStatus.BAD_REQUEST)
+            else:
+                send_json(self, resp)
+            return
+
+        self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
 
 def main():
