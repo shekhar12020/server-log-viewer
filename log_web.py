@@ -398,6 +398,28 @@ INDEX_HTML = """
     button:active { 
       background: #dc2626; 
     }
+    /* Tabs */
+    .tabs {
+      max-width: 1400px; margin: 10px auto 0; display: flex; gap: 10px;
+      padding: 8px 12px; background: #ffffff; border: 1px solid #e5e7eb;
+      border-radius: 10px; box-shadow: 0 4px 14px rgba(0,0,0,0.06);
+    }
+    .tab-btn {
+      appearance: none; border: 1px solid #d1d5db; background: #f3f4f6; color: #111827;
+      padding: 10px 16px; border-radius: 10px; cursor: pointer;
+      font-weight: 700; font-size: 15px; letter-spacing: .2px;
+      transition: all .15s ease; position: relative;
+    }
+    .tab-btn:hover { background: #e5e7eb; box-shadow: 0 2px 6px rgba(0,0,0,.08); }
+    .tab-btn.active { background: #2563eb; color: #fff; border-color: #2563eb; box-shadow: 0 6px 16px rgba(37,99,235,.25); }
+    .tab-btn.active::after {
+      content: '';
+      position: absolute; left: 50%; transform: translateX(-50%);
+      bottom: -9px; width: 28px; height: 4px; border-radius: 999px; background: #2563eb;
+      box-shadow: 0 2px 6px rgba(37,99,235,.5);
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
     .log-container {
       display: flex;
       flex: 1;
@@ -558,6 +580,21 @@ INDEX_HTML = """
       let userInteracting = false; // True briefly after wheel/touch/keys/mouse to mark manual intent
     
     function $(id){ return document.getElementById(id); }
+        function switchTab(tab){
+          const panels = [ 'panel-logs', 'panel-db' ];
+          const buttons = [ 'tabLogs', 'tabDb' ];
+          for (const id of panels) { const el = $(id); if (el) { el.classList.remove('active'); } }
+          for (const id of buttons) { const el = $(id); if (el) { el.classList.remove('active'); } }
+          if (tab === 'db') {
+            $('panel-db')?.classList.add('active');
+            $('tabDb')?.classList.add('active');
+            location.hash = '#db';
+          } else {
+            $('panel-logs')?.classList.add('active');
+            $('tabLogs')?.classList.add('active');
+            location.hash = '#logs';
+          }
+        }
         async function loadDbTables(){
           try {
             const t = dbToken || (new URLSearchParams(location.search)).get('db_token') || $('dbToken')?.value || '';
@@ -1131,12 +1168,23 @@ INDEX_HTML = """
       
       // Add scroll listener to detect manual scrolling
       $('log').addEventListener('scroll', checkScrollPosition);
+
+      // Tabs init
+      const hash = location.hash || '#logs';
+      switchTab(hash === '#db' ? 'db' : 'logs');
+      $('tabLogs')?.addEventListener('click', () => switchTab('logs'));
+      $('tabDb')?.addEventListener('click', () => switchTab('db'));
     });
     
   </script>
   </head>
   <body>
-    <div class="container">
+    <div class="tabs">
+      <button id="tabLogs" class="tab-btn">Logs</button>
+      <button id="tabDb" class="tab-btn">Database</button>
+    </div>
+    <div id="panel-logs" class="tab-panel active">
+      <div class="container">
       <header>
         <h1>📊 QR Table Backend Logs</h1>
         <div class="controls">
@@ -1184,8 +1232,10 @@ INDEX_HTML = """
         <pre id="log"></pre>
       </div>
     </div>
+    </div>
     <!-- Read-only Database Panel -->
-    <div class="container" style="margin-top: 10px;">
+    <div id="panel-db" class="tab-panel">
+      <div class="container" style="margin-top: 10px;">
       <header>
         <h1>🗄️ Database (read-only)</h1>
         <div class="controls">
@@ -1231,6 +1281,7 @@ INDEX_HTML = """
           </div>
         </div>
         <div id="dbResult" style="padding: 20px; margin: 0; background: #0d1117; color: #c9d1d9; height: calc(100vh - 360px); min-height: 360px; overflow: auto; border: 1px solid #30363d; border-radius: 12px;"></div>
+      </div>
       </div>
     </div>
   </body>
