@@ -37,6 +37,49 @@ except ImportError:
     PSYCOPG2_AVAILABLE = False
 
 
+# Lightweight .env loader (no external deps). Loads key=value pairs from a .env
+# file located in the current working directory or alongside this script. Values
+# from the process environment take precedence over .env values.
+def _load_dotenv():
+    candidates = []
+    # CWD .env
+    try:
+        candidates.append(os.path.join(os.getcwd(), ".env"))
+    except Exception:
+        pass
+    # Script directory .env
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates.append(os.path.join(script_dir, ".env"))
+    except Exception:
+        pass
+
+    for path in candidates:
+        try:
+            if not os.path.isfile(path):
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    # Do not overwrite if already set in the environment
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+        except Exception:
+            # Silently ignore .env errors; app can still run with process env
+            continue
+
+
+# Load .env BEFORE reading any configuration values below
+_load_dotenv()
+
+
 HOST = os.environ.get("LOG_WEB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("LOG_WEB_PORT", "8080"))
 DOCKER_SUDO = os.environ.get("LOG_WEB_DOCKER_SUDO", "0").strip() in ("1", "true", "yes", "on")
