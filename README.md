@@ -12,6 +12,7 @@ A real-time web application for viewing and monitoring Docker container logs wit
   - Search functionality
   - Pause/Resume/Stop controls
   - Clear logs button
+- **Database Integration**: Read-only database access with table browsing and custom SQL queries
 - **Responsive Design**: Works on desktop and mobile devices
 - **Line Numbers**: Synchronized line numbers for easy reference
 - **Status Indicators**: Live/Paused/Ready status with visual feedback
@@ -36,6 +37,8 @@ A real-time web application for viewing and monitoring Docker container logs wit
 2. **Install dependencies** (uses only standard library):
    ```bash
    # No additional dependencies required!
+   # Optional: Install psycopg2 for direct database connections
+   pip install psycopg2-binary
    ```
 
 3. **Configure environment variables** (optional):
@@ -44,6 +47,13 @@ A real-time web application for viewing and monitoring Docker container logs wit
    export LOG_WEB_PORT=8080
    export LOG_WEB_TOKEN=your-secret-token
    export LOG_WEB_DOCKER_SUDO=1  # If Docker requires sudo
+   
+   # Database configuration (optional)
+   export LOG_WEB_DB_HOST=your-db-host
+   export LOG_WEB_DB_NAME=your-db-name
+   export LOG_WEB_DB_USER_RO=readonly-user
+   export LOG_WEB_DB_PASS_RO=readonly-password
+   export LOG_WEB_DB_TOKEN=your-db-token
    ```
 
 4. **Run the application**:
@@ -61,11 +71,17 @@ A real-time web application for viewing and monitoring Docker container logs wit
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LOG_WEB_HOST` | `0.0.0.0` | Host to bind the server to |
+| `LOG_WEB_HOST` | `127.0.0.1` | Host to bind the server to |
 | `LOG_WEB_PORT` | `8080` | Port to run the server on |
 | `LOG_WEB_TOKEN` | `""` | Optional authentication token |
 | `LOG_WEB_DOCKER_SUDO` | `0` | Use sudo for Docker commands (0/1) |
 | `LOG_WEB_DOCKER_BIN` | `docker` | Path to Docker binary |
+| `LOG_WEB_DB_HOST` | `""` | Database host for direct connections |
+| `LOG_WEB_DB_NAME` | `""` | Database name |
+| `LOG_WEB_DB_USER_RO` | `""` | Read-only database user |
+| `LOG_WEB_DB_PASS_RO` | `""` | Read-only database password |
+| `LOG_WEB_DB_TOKEN` | `""` | Database access token |
+| `LOG_WEB_DB_CONTAINER` | `""` | Docker container for database access |
 
 ### Docker Permissions
 
@@ -94,6 +110,7 @@ python3 log_web.py
 4. **Stop**: Click "⏹ Stop" to stop following and clear logs
 5. **Search**: Use the search box to filter logs by content
 6. **Filter by Level**: Select specific log levels (DEBUG, INFO, WARN, ERROR, CRITICAL)
+7. **Database Access**: Switch to the Database tab to browse tables and run queries
 
 ### Smart Scrolling
 
@@ -129,9 +146,15 @@ The app supports optional token-based authentication:
 
 ## 🔍 API Endpoints
 
+### Logs
 - `GET /` - Main web interface
 - `GET /containers` - List available containers
 - `GET /stream?container=NAME&level=LEVEL&q=QUERY` - Stream logs via SSE
+
+### Database (Read-only)
+- `GET /db/tables` - List available database tables
+- `GET /db/table?name=TABLE&limit=LIMIT&offset=OFFSET` - Get table data
+- `POST /db/query` - Execute custom SELECT queries
 
 ## 🐛 Troubleshooting
 
@@ -159,8 +182,7 @@ The app supports optional token-based authentication:
 
 ```
 access-server-logs/
-├── log_web.py          # Main Flask web application
-├── log_tui.py          # Terminal UI version (curses)
+├── log_web.py          # Main web application
 └── README.md           # This file
 ```
 
