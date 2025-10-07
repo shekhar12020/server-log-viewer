@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  log-viewer:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # Basic configuration
+      - LOG_WEB_HOST=0.0.0.0
+      - LOG_WEB_PORT=8080
+      
+      # Optional: Authentication
+      # - LOG_WEB_TOKEN=your-secret-token
+      
+      # Optional: Docker access (if needed)
+      # - LOG_WEB_DOCKER_SUDO=1
+      
+      # Optional: Database configuration
+      # - LOG_WEB_DB_HOST=your-db-host
+      # - LOG_WEB_DB_NAME=your-db-name
+      # - LOG_WEB_DB_USER_RO=readonly-user
+      # - LOG_WEB_DB_PASS_RO=readonly-password
+      # - LOG_WEB_DB_TOKEN=your-db-token
+      
+    volumes:
+      # Mount Docker socket to access Docker daemon
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      
+    restart: unless-stopped
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

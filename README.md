@@ -22,48 +22,70 @@ A real-time web application for viewing and monitoring Docker container logs wit
 
 ### Prerequisites
 
-- Python 3.6+
 - Docker installed and running
-- Access to Docker containers (may require sudo)
+- Git (for cloning the repository)
 
-### Installation
+### Installation & Deployment
 
-1. **Clone the repository**:
+#### Option 1: Docker (Recommended)
+
+1. **Clone the repository on your server**:
    ```bash
-   git clone git@github.com:shekhar12020/access-server-logs.git
-   cd access-server-logs
+   git clone https://github.com/shekhar12020/server-log-viewer.git
+   cd server-log-viewer
    ```
 
-2. **Install dependencies** (uses only standard library):
+2. **Build and run with Docker**:
    ```bash
-   # No additional dependencies required!
-   # Optional: Install psycopg2 for direct database connections
-   pip install psycopg2-binary
+   # Build the Docker image
+   docker build -t log-viewer .
+   
+   # Run the container
+   docker run -d \
+     --name log-viewer \
+     -p 8080:8080 \
+     -v /var/run/docker.sock:/var/run/docker.sock:ro \
+     --restart unless-stopped \
+     log-viewer
    ```
 
-3. **Configure environment variables** (optional):
+3. **Or use Docker Compose** (easier):
+   ```bash
+   # Start the application
+   docker-compose up -d
+   
+   # View logs
+   docker-compose logs -f
+   
+   # Stop the application
+   docker-compose down
+   ```
+
+4. **Access the web interface**:
+   - Open your browser to `http://your-server-ip:8080`
+   - If using token auth: `http://your-server-ip:8080?token=your-secret-token`
+
+#### Option 2: Direct Python (Development)
+
+1. **Clone and setup**:
+   ```bash
+   git clone https://github.com/shekhar12020/server-log-viewer.git
+   cd server-log-viewer
+   pip install psycopg2-binary  # Optional: for database features
+   ```
+
+2. **Configure environment variables** (optional):
    ```bash
    export LOG_WEB_HOST=0.0.0.0
    export LOG_WEB_PORT=8080
    export LOG_WEB_TOKEN=your-secret-token
    export LOG_WEB_DOCKER_SUDO=1  # If Docker requires sudo
-   
-   # Database configuration (optional)
-   export LOG_WEB_DB_HOST=your-db-host
-   export LOG_WEB_DB_NAME=your-db-name
-   export LOG_WEB_DB_USER_RO=readonly-user
-   export LOG_WEB_DB_PASS_RO=readonly-password
-   export LOG_WEB_DB_TOKEN=your-db-token
    ```
 
-4. **Run the application**:
+3. **Run the application**:
    ```bash
    python3 log_web.py
    ```
-
-5. **Access the web interface**:
-   - Open your browser to `http://localhost:8080`
-   - If using token auth: `http://localhost:8080?token=your-secret-token`
 
 ## 🔧 Configuration
 
@@ -178,11 +200,21 @@ The app supports optional token-based authentication:
 - Verify container name is correct
 - Check Docker logs manually: `docker logs CONTAINER_NAME`
 
+**Docker-specific issues**:
+- **Permission denied**: Ensure Docker socket is accessible: `sudo chmod 666 /var/run/docker.sock`
+- **Container can't access Docker**: Check volume mount: `-v /var/run/docker.sock:/var/run/docker.sock:ro`
+- **Build fails**: Check Docker is running: `docker --version`
+- **Port already in use**: Change port mapping: `-p 8081:8080`
+
 ## 📁 File Structure
 
 ```
-access-server-logs/
+server-log-viewer/
 ├── log_web.py          # Main web application
+├── Dockerfile          # Docker configuration
+├── docker-compose.yml  # Docker Compose configuration
+├── requirements.txt    # Python dependencies
+├── .dockerignore       # Docker build context exclusions
 └── README.md           # This file
 ```
 

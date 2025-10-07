@@ -1,0 +1,6 @@
+# Core dependencies (most are optional)
+psycopg2-binary>=2.9.0
+
+# Note: The application uses only Python standard library
+# psycopg2-binary is only needed for direct database connections
+# If you don't need database features, you can remove this file
